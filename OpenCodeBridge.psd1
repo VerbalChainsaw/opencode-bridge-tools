@@ -23,7 +23,9 @@
     'profile-loader.ps1',
     'install.ps1',
     'run-tests.ps1',
-    'tests\OpenCodeBridge.Tests.ps1'
+    'tests\OpenCodeBridge.Tests.ps1',
+    'README.md',
+    'LICENSE'
   )
   PrivateData       = @{
     PSData = @{
