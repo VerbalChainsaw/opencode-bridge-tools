@@ -17,19 +17,35 @@
 
 # ── Configuration ──────────────────────────────────────────────────
 # Paths may be overridden via env vars (prefixed with OPENCODE_BRIDGE_).
+# Helper: safely coerce an env-var to int, falling back to default on
+# non-numeric or empty values. Prevents $null from leaking into
+# port/timeout logic when the env var contains garbage.
+function script:Get-EnvInt {
+  param([string]$Name, [int]$Default)
+  if (-not (Test-Path "env:$Name")) { return $Default }
+  $raw = (Get-Item "env:$Name").Value
+  if ([string]::IsNullOrEmpty($raw)) { return $Default }
+  $parsed = 0
+  if ([int]::TryParse($raw, [ref]$parsed)) { return $parsed }
+  Write-Warning "[opencode-bridge] Env $Name='$raw' is not a valid integer — using default $Default"
+  return $Default
+}
+
 $script:BridgeCmd        = if (Test-Path env:OPENCODE_BRIDGE_CMD)       { $env:OPENCODE_BRIDGE_CMD       } else { "C:\hermes\gateway-service\Hermes_Gateway.cmd" }
 $script:BridgeWorkDir    = if (Test-Path env:OPENCODE_BRIDGE_WORKDIR)   { $env:OPENCODE_BRIDGE_WORKDIR   } else { "C:\hermes" }
-$script:BridgePort       = if (Test-Path env:OPENCODE_BRIDGE_PORT)      { [int]$env:OPENCODE_BRIDGE_PORT  } else { 8642 }
+$script:BridgePort       = Get-EnvInt -Name 'OPENCODE_BRIDGE_PORT'       -Default 8642
 $script:BridgeHost       = if (Test-Path env:OPENCODE_BRIDGE_HOST)      { $env:OPENCODE_BRIDGE_HOST      } else { "127.0.0.1" }
 $script:BridgeCmdNeedle  = "hermes_cli.main"        # appears in the pythonw cmdline
 $script:BridgeImageName  = "pythonw"                # image name we expect on the port
 
 # Timeout / retry constants (also env-overridable)
-$script:StaleLockMinutes = if (Test-Path env:OPENCODE_BRIDGE_STALE_LOCK_MIN) { [int]$env:OPENCODE_BRIDGE_STALE_LOCK_MIN } else { 5 }
-$script:StartTimeoutSec  = if (Test-Path env:OPENCODE_BRIDGE_START_TIMEOUT)  { [int]$env:OPENCODE_BRIDGE_START_TIMEOUT  } else { 25 }
-$script:StartRetryCount  = if (Test-Path env:OPENCODE_BRIDGE_START_RETRIES)  { [int]$env:OPENCODE_BRIDGE_START_RETRIES  } else { 3 }
+$script:StaleLockMinutes = Get-EnvInt -Name 'OPENCODE_BRIDGE_STALE_LOCK_MIN' -Default 5
+$script:StartTimeoutSec  = Get-EnvInt -Name 'OPENCODE_BRIDGE_START_TIMEOUT'  -Default 25
+$script:StartRetryCount  = Get-EnvInt -Name 'OPENCODE_BRIDGE_START_RETRIES'  -Default 3
 $script:MinSessionSec    = 15                       # short sessions leave the bridge up
 $script:MaxConfigSize    = 1048576                  # 1 MB cap for config files
+$script:FastPollSleepMs  = 250                      # fast-poll interval during early startup
+$script:FastPollTimeoutSec = 5                      # fast-poll window before switching to slow poll
 
 # Derived paths (read-only after init)
 $script:LockFilePath     = Join-Path $env:LOCALAPPDATA "opencode-bridge-starting.lock"
@@ -210,8 +226,23 @@ function Start-OpenCodeBridge {
         continue
       }
 
-      # Health check: wait for the port, watching process liveness each cycle
+      # Health check: fast-poll first (gateway typically binds within 5s),
+      # then fall back to slow poll to avoid blocking the user unnecessarily.
       $elapsed = 0
+      while ($elapsed -lt $script:FastPollTimeoutSec) {
+        $pid_ = Get-BridgeProcessId
+        if ($pid_) {
+          Write-Host "[opencode-bridge] Gateway ready (pid $pid_)"
+          return
+        }
+        if ($proc.HasExited) {
+          Write-Warning "[opencode-bridge] Process exited early (code $($proc.ExitCode)) on attempt $attempt/$($script:StartRetryCount)"
+          break
+        }
+        Start-Sleep -Milliseconds $script:FastPollSleepMs
+        $elapsed += ($script:FastPollSleepMs / 1000.0)
+      }
+      # Slow poll for the remaining time
       while ($elapsed -lt $script:StartTimeoutSec) {
         $pid_ = Get-BridgeProcessId
         if ($pid_) {
@@ -256,6 +287,7 @@ function Stop-OpenCodeBridge {
 
   # Wait for opencode to fully exit, then confirm no other opencode remains
   Start-Sleep -Seconds 3
+  $remaining = @()
   for ($i = 0; $i -lt 5; $i++) {
     $remaining = @(Get-Process -Name "opencode" -ErrorAction SilentlyContinue)
     if ($remaining.Count -eq 0) { break }
@@ -266,6 +298,11 @@ function Stop-OpenCodeBridge {
   # Locate the verified gateway process; never kill on port match alone
   $pid_ = Get-BridgeProcessId
   if (-not $pid_) { return }
+
+  # Re-check: another opencode could have started between the poll and
+  # the PID lookup (TOCTOU window). One extra poll before pulling the trigger.
+  $recheck = @(Get-Process -Name "opencode" -ErrorAction SilentlyContinue)
+  if ($recheck.Count -gt 0) { return }
 
   try {
     $proc = Get-Process -Id $pid_ -ErrorAction Stop
@@ -349,20 +386,21 @@ function Test-OpenCodeConfig {
     $Text
   }
 
-  # Helper: parse JSONC file with size limit and comment stripping
+  # Helper: parse JSONC file with size limit and comment stripping.
+  # Reads file content first, then validates size — avoids symlink
+  # TOCTOU between Get-Item and Get-Content.
   $parseJsonc = {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
       Write-Warning "[opencode-bridge] Missing config: $Path"
       return $null
     }
-    $size = (Get-Item $Path).Length
-    if ($size -gt $script:MaxConfigSize) {
-      Write-Warning "[opencode-bridge] Config too large ($size bytes, max $($script:MaxConfigSize)): $Path"
-      return $null
-    }
     try {
-      $raw = Get-Content -Raw -LiteralPath $Path
+      $raw = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
+      if ($raw.Length -gt $script:MaxConfigSize) {
+        Write-Warning "[opencode-bridge] Config too large ($($raw.Length) bytes, max $($script:MaxConfigSize)): $Path"
+        return $null
+      }
       ($raw | ForEach-Object { & $stripComments $_ }) | ConvertFrom-Json -ErrorAction Stop
     } catch {
       Write-Warning "[opencode-bridge] Could not parse $Path : $_"

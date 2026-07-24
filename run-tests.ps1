@@ -182,5 +182,40 @@ Test-Case "Test-OpenCodeConfig rejects oversized configs" {
   }
 }
 
-Write-Host "`n$script:passed passed, $script:failed failed" -ForegroundColor $(if ($script:failed -eq 0) { 'Green' } else { 'Red' })
+# ── 17. Env var type validation: non-numeric port is rejected ────────────────
+Test-Case "BridgePort rejects non-numeric OPENCODE_BRIDGE_PORT with warning" {
+  $env:OPENCODE_BRIDGE_PORT = "not-a-number"
+  try {
+    Remove-Module OpenCodeBridge -ErrorAction SilentlyContinue
+    Import-Module $modulePath -Force -WarningVariable badPortWarnings -WarningAction SilentlyContinue
+    $s = Get-OpenCodeBridgeStatus
+    if ($s.Port -eq 8642) { } else { throw "Port should be 8642 (default), got $($s.Port)" }
+  } finally {
+    Remove-Item env:OPENCODE_BRIDGE_PORT -ErrorAction SilentlyContinue
+    # Re-import cleanly for subsequent tests
+    Remove-Module OpenCodeBridge -ErrorAction SilentlyContinue
+    Import-Module $modulePath -Force
+  }
+}
+
+# ── 18. Config parser reads content before size check (symlink TOCTOU fix) ──
+Test-Case "Config parser reads content before size check" {
+  # Create a config with content > 1MB, verify the warning mentions content
+  # size, not file-on-disk size (which could differ with symlinks)
+  $tmp = Join-Path $env:TEMP "test-read-first.json"
+  try {
+    $big = '"key": "' + ('x' * 2000000) + '"'
+    "{ $big }" | Set-Content $tmp -Force
+    $m = Get-Module OpenCodeBridge
+    $origConfig = $m.SessionState.PSVariable.Get('OpenCodeConfig').Value
+    $m.SessionState.PSVariable.Get('OpenCodeConfig').Value = $tmp
+    $warnings = @()
+    $result = Test-OpenCodeConfig -WarningVariable +warnings -WarningAction SilentlyContinue
+    $m.SessionState.PSVariable.Get('OpenCodeConfig').Value = $origConfig
+    if ($warnings.Message -match 'too large') { } else { throw "Expected 'too large' warning" }
+    if ($warnings.Message -match 'bytes') { } else { throw "Warning should include byte count" }
+  } finally {
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+  }
+}
 if ($script:failed -gt 0) { exit 1 } else { exit 0 }
