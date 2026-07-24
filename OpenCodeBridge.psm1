@@ -133,42 +133,48 @@ function script:Start-HealthWorker {
   $logFile = Join-Path $env:LOCALAPPDATA 'opencode-bridge.log'
 
   $script:HealthWorker = Start-Job -Name 'OpenCodeBridgeHealth' -ScriptBlock {
-    param($modPath, $port, $hostAddr, $endpoint, $pollSec, $idleMin, $pfx, $logFile)
-    # Wait for gateway to actually be ready (may still be starting up)
-    Start-Sleep -Seconds 15
+    param($port, $hostAddr, $endpoint, $pollSec, $idleMin, $pfx, $logFile, $bridgeCmd, $bridgeWorkDir)
+
+    # Helper: restart the gateway from within the job (no module access).
+    $restartGateway = {
+      try { $p = Start-Process -FilePath $bridgeCmd -WorkingDirectory $bridgeWorkDir -WindowStyle Hidden -PassThru; $p.Id } catch { $null }
+    }
+
+    Start-Sleep -Seconds 10  # let the gateway finish starting up
 
     while ($true) {
       Start-Sleep -Seconds $pollSec
 
-      # Check gateway liveness
+      # Health check: any response = alive
       $alive = $false
-      try { $null = Invoke-RestMethod -Uri $endpoint -TimeoutSec 5 -ErrorAction Stop; $alive = $true } catch {}
+      try { $null = Invoke-RestMethod -Uri $endpoint -TimeoutSec 5 -ErrorAction Stop; $alive = $true }
+      catch { $alive = ($null -ne $_.Exception.Response) }
+
       if (-not $alive) {
         "$(Get-Date -Format o) $pfx Health check FAILED — attempting restart" | Add-Content $logFile
-        try { Start-OpenCodeBridge } catch {}
+        & $restartGateway
         continue
       }
 
-      # Check idle timeout (disabled if idleMin <= 0)
+      # Idle timeout
       if ($idleMin -le 0) { continue }
-
-      # Read last activity from a shared state file
       $actFile = Join-Path $env:LOCALAPPDATA 'opencode-bridge-activity.txt'
       $idle = [int]::MaxValue
       if (Test-Path $actFile) {
         try { $last = [datetime]::Parse((Get-Content $actFile -Raw).Trim()); $idle = [int]((Get-Date) - $last).TotalMinutes } catch {}
       }
       if ($idle -ge $idleMin) {
-        # Confirm no opencode processes are running before stopping
         $procs = @(Get-Process -Name 'opencode' -IncludeUserName -ErrorAction SilentlyContinue | Where-Object UserName -eq $env:USERNAME)
         if ($procs.Count -eq 0) {
           "$(Get-Date -Format o) $pfx Idle timeout ($idleMin min) — stopping gateway" | Add-Content $logFile
-          try { Stop-OpenCodeBridge -SessionDuration 999 } catch {}
+          Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Get-Process -Id $_.OwningProcess -ErrorAction Stop | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+          }
           break
         }
       }
     }
-  } -ArgumentList $modPath, $script:BridgePort, $script:BridgeHost, $script:HealthEndpoint, $script:HealthPollSec, $script:IdleTimeoutMin, $script:Prefix, $logFile
+  } -ArgumentList $script:BridgePort, $script:BridgeHost, $script:HealthEndpoint, $script:HealthPollSec, $script:IdleTimeoutMin, $script:Prefix, $logFile, $script:BridgeCmd, $script:BridgeWorkDir
 
   LogDbg "Health worker started (poll=${pollSec}s, idle=${idleMin}m)"
 }
@@ -247,7 +253,7 @@ function Start-OpenCodeBridge {
   [OutputType([void])] param()
 
   $ps = Get-PortState
-  if ($ps.State -eq 'gateway') { LogDbg "Gateway already up (pid $($ps.Pid))"; return }
+  if ($ps.State -eq 'gateway') { LogDbg "Gateway already up (pid $($ps.Pid))"; Start-HealthWorker; return }
   if ($ps.State -eq 'intruder') { LogWarn "Port $($script:BridgePort) held by non-Hermes process — refusing to start"; return }
   if (-not (Test-Path $script:BridgeCmd)) { LogWarn "Gateway script not found: $($script:BridgeCmd)"; return }
 
