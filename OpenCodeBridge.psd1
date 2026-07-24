@@ -1,6 +1,6 @@
 @{
   RootModule        = 'OpenCodeBridge.psm1'
-  ModuleVersion     = '2.0.0'
+  ModuleVersion     = '2.1.0'
   GUID              = '4030d944-02aa-47cc-8f50-43d68a362e08'
   Author            = 'zerop'
   CompanyName       = 'Unknown'
@@ -14,7 +14,13 @@
     'Get-OpenCodeBridgeStatus',
     'Test-OpenCodeConfig'
   )
-  FileList          = @('OpenCodeBridge.psm1')
+  FileList          = @(
+    'OpenCodeBridge.psm1',
+    'OpenCodeBridge.psd1',
+    'profile-loader.ps1',
+    'run-tests.ps1',
+    'tests\OpenCodeBridge.Tests.ps1'
+  )
   PrivateData       = @{
     PSData = @{
       Tags       = @('opencode', 'hermes', 'nous', 'bridge', 'gateway', 'oh-my-opencode-slim')

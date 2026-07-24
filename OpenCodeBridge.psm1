@@ -1,3 +1,5 @@
+#Requires -Version 7.0
+
 # OpenCodeBridge.psm1 - OpenCode lifecycle manager
 #
 # This module manages the lifecycle of an `opencode` invocation, including the
@@ -14,34 +16,48 @@
 #   Test-OpenCodeConfig       Validate opencode.jsonc + oh-my-opencode-slim preset.
 
 # ── Configuration ──────────────────────────────────────────────────
-$script:BridgeCmd        = "C:\hermes\gateway-service\Hermes_Gateway.cmd"
-$script:BridgeWorkDir    = "C:\hermes"
-$script:BridgePort       = 8642
-$script:BridgeHost       = "127.0.0.1"
+# Paths may be overridden via env vars (prefixed with OPENCODE_BRIDGE_).
+$script:BridgeCmd        = if (Test-Path env:OPENCODE_BRIDGE_CMD)       { $env:OPENCODE_BRIDGE_CMD       } else { "C:\hermes\gateway-service\Hermes_Gateway.cmd" }
+$script:BridgeWorkDir    = if (Test-Path env:OPENCODE_BRIDGE_WORKDIR)   { $env:OPENCODE_BRIDGE_WORKDIR   } else { "C:\hermes" }
+$script:BridgePort       = if (Test-Path env:OPENCODE_BRIDGE_PORT)      { [int]$env:OPENCODE_BRIDGE_PORT  } else { 8642 }
+$script:BridgeHost       = if (Test-Path env:OPENCODE_BRIDGE_HOST)      { $env:OPENCODE_BRIDGE_HOST      } else { "127.0.0.1" }
 $script:BridgeCmdNeedle  = "hermes_cli.main"        # appears in the pythonw cmdline
 $script:BridgeImageName  = "pythonw"                # image name we expect on the port
-$script:LockFilePath     = Join-Path $env:LOCALAPPDATA "opencode-bridge-starting.lock"
-$script:StaleLockMinutes = 5
-$script:StartTimeoutSec  = 25
-$script:StartRetryCount  = 3
+
+# Timeout / retry constants (also env-overridable)
+$script:StaleLockMinutes = if (Test-Path env:OPENCODE_BRIDGE_STALE_LOCK_MIN) { [int]$env:OPENCODE_BRIDGE_STALE_LOCK_MIN } else { 5 }
+$script:StartTimeoutSec  = if (Test-Path env:OPENCODE_BRIDGE_START_TIMEOUT)  { [int]$env:OPENCODE_BRIDGE_START_TIMEOUT  } else { 25 }
+$script:StartRetryCount  = if (Test-Path env:OPENCODE_BRIDGE_START_RETRIES)  { [int]$env:OPENCODE_BRIDGE_START_RETRIES  } else { 3 }
 $script:MinSessionSec    = 15                       # short sessions leave the bridge up
+$script:MaxConfigSize    = 1048576                  # 1 MB cap for config files
+
+# Derived paths (read-only after init)
+$script:LockFilePath     = Join-Path $env:LOCALAPPDATA "opencode-bridge-starting.lock"
 $script:OpenCodeConfig   = Join-Path $env:USERPROFILE ".config\opencode\opencode.jsonc"
 $script:OpenCodeSlimCfg  = Join-Path $env:USERPROFILE ".config\opencode\oh-my-opencode-slim.json"
 $script:HermesProvider   = "hermes-nous"
-$script:SessionDuration  = 0
 
 # ── Helpers (module-private) ───────────────────────────────────────
 
 function script:Get-BridgeConnection {
+  <#
+  .SYNOPSIS
+    Returns the TCP connection holding the bridge port, or $null.
+    Checks Listen, Bound, and Established states because Windows
+    Get-NetTCPConnection does not always report Listen for every socket.
+  #>
   [CmdletBinding()] param()
-  Get-NetTCPConnection -LocalPort $script:BridgePort -State Listen -ErrorAction SilentlyContinue |
-    Where-Object { $_.LocalAddress -in @($script:BridgeHost, '0.0.0.0', '::') } |
+  Get-NetTCPConnection -LocalPort $script:BridgePort -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.State -in @('Listen', 'Bound', 'Established') -and
+      $_.LocalAddress -in @($script:BridgeHost, '0.0.0.0', '::')
+    } |
     Select-Object -First 1
 }
 
 function script:Test-BridgeProcess {
   # Verify a PID actually looks like the Hermes gateway by image + cmdline.
-  # Prevents mis-attribution if an unrelated python process happens to bind 8642.
+  # Prevents mis-attribution if an unrelated python process happens to bind the port.
   [CmdletBinding()] param([int]$ProcessId)
   $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
   if (-not $p) { return $false }
@@ -64,24 +80,64 @@ function script:Get-BridgeProcessId {
 # Return one of: 'none' (port free), 'gateway' (verified Hermes), 'intruder'
 # (someone else on the port). Used by Start-OpenCodeBridge to decide whether
 # the fast path succeeds, the retry loop runs, or we bail immediately.
+# When returning 'intruder', also emits a warning with the intruder's details.
 function script:Get-PortOccupant {
   [CmdletBinding()] param()
   $conn = Get-BridgeConnection
   if (-not $conn) { return 'none' }
   if (Test-BridgeProcess -ProcessId $conn.OwningProcess) { return 'gateway' }
+  # Log the intruder for debugging
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
+  $desc = if ($p) { "$($p.Name) '$($p.CommandLine)'" } else { "unknown process" }
+  Write-Warning "[opencode-bridge] Port $($script:BridgePort) held by pid $($conn.OwningProcess) ($desc) — it is NOT the Hermes gateway"
   return 'intruder'
 }
 
-function script:Remove-StaleLock {
+function script:Acquire-Lock {
+  <#
+  .SYNOPSIS
+    Atomically acquires the startup lock file.
+  .DESCRIPTION
+    Uses [System.IO.File]::Open with FileMode.CreateNew for atomicity.
+    Stale locks are removed first. Returns a disposable FileStream or $null
+    if another instance holds the lock.
+  #>
   [CmdletBinding()] param()
-  if (-not (Test-Path $script:LockFilePath)) { return $false }
-  $age = [int]((Get-Date) - (Get-Item $script:LockFilePath).CreationTime).TotalMinutes
-  if ($age -ge $script:StaleLockMinutes) {
-    Write-Warning "[opencode-bridge] Removing stale lock ($age min old)"
-    Remove-Item -LiteralPath $script:LockFilePath -Force -ErrorAction SilentlyContinue
-    return $true
+
+  # Check for and remove stale lock
+  if (Test-Path $script:LockFilePath) {
+    try {
+      $age = [int]((Get-Date) - (Get-Item $script:LockFilePath).CreationTime).TotalMinutes
+      if ($age -ge $script:StaleLockMinutes) {
+        Write-Warning "[opencode-bridge] Removing stale lock ($age min old)"
+        Remove-Item -LiteralPath $script:LockFilePath -Force -ErrorAction Stop
+      }
+    } catch {
+      # Could not read or remove — likely permission issue
+      Write-Warning "[opencode-bridge] Cannot read/remove lock file: $_"
+      return $null
+    }
   }
-  return $false
+
+  try {
+    return [System.IO.File]::Open(
+      $script:LockFilePath,
+      [System.IO.FileMode]::CreateNew,
+      [System.IO.FileAccess]::Write,
+      [System.IO.FileShare]::None
+    )
+  } catch {
+    Write-Warning "[opencode-bridge] Another shell is already starting the gateway"
+    return $null
+  }
+}
+
+function script:Release-Lock {
+  param($Lock)
+  if ($Lock) {
+    try { $Lock.Dispose() } catch {}
+  }
+  Remove-Item -LiteralPath $script:LockFilePath -ErrorAction SilentlyContinue
 }
 
 # ── Public functions ───────────────────────────────────────────────
@@ -97,14 +153,16 @@ function script:Remove-StaleLock {
   port + process liveness each cycle. A file lock prevents concurrent
   launches across multiple terminals (TOCTOU guard); locks older than 5
   minutes are treated as orphaned from a crash and removed.
+
+  The retry loop re-checks for an intruder at each attempt — if a non-Hermes
+  process binds the port mid-startup, we bail instead of retrying.
 #>
 function Start-OpenCodeBridge {
   [CmdletBinding()] param()
 
   # Inspect the port first. Three states:
   #   'gateway'  -> fast path, done
-  #   'intruder' -> bail. Do NOT launch a clone that will conflict, and
-  #                 do NOT loop-retry against a non-Hermes occupier.
+  #   'intruder' -> bail. Do NOT launch a clone that will conflict.
   #   'none'     -> proceed to launch the gateway
   $occupant = Get-PortOccupant
   if ($occupant -eq 'gateway') {
@@ -123,26 +181,24 @@ function Start-OpenCodeBridge {
     return
   }
 
-  $staleRemoved = Remove-StaleLock
-
-  # Acquire exclusive lock (TOCTOU guard across terminals)
-  $lock = $null
-  try {
-    $lock = [System.IO.File]::Open(
-      $script:LockFilePath,
-      [System.IO.FileMode]::CreateNew,
-      [System.IO.FileAccess]::Write,
-      [System.IO.FileShare]::None
-    )
-  } catch {
-    if (-not $staleRemoved) {
-      Write-Warning "[opencode-bridge] Another shell is already starting the gateway"
-    }
-    return
-  }
+  $lock = Acquire-Lock
+  if (-not $lock) { return }
 
   try {
     for ($attempt = 1; $attempt -le $script:StartRetryCount; $attempt++) {
+      # Re-check the port at each attempt: an intruder could have appeared
+      $occupant = Get-PortOccupant
+      if ($occupant -eq 'gateway') {
+        # Gateway came up from a previous attempt's child — done
+        $pid_ = Get-BridgeProcessId
+        Write-Verbose "[opencode-bridge] Gateway ready from prior attempt (pid $pid_)"
+        return
+      }
+      if ($occupant -eq 'intruder') {
+        Write-Warning "[opencode-bridge] Non-Hermes process bound port during startup — aborting"
+        return
+      }
+
       $proc = $null
       try {
         $proc = Start-Process -FilePath $script:BridgeCmd `
@@ -178,8 +234,7 @@ function Start-OpenCodeBridge {
     }
     Write-Warning "[opencode-bridge] Gateway failed after $($script:StartRetryCount) attempts — opencode will use fallback providers"
   } finally {
-    if ($lock) { $lock.Dispose() }
-    Remove-Item -LiteralPath $script:LockFilePath -ErrorAction SilentlyContinue
+    Release-Lock $lock
   }
 }
 
@@ -194,14 +249,13 @@ function Start-OpenCodeBridge {
   (matched by image path + cmdline, never by port number alone).
 #>
 function Stop-OpenCodeBridge {
-  [CmdletBinding()] param([int]$SessionDuration = $script:SessionDuration)
+  [CmdletBinding()] param([int]$SessionDuration = 0)
 
   # Short sessions leave the bridge up
   if ($SessionDuration -lt $script:MinSessionSec) { return }
 
   # Wait for opencode to fully exit, then confirm no other opencode remains
   Start-Sleep -Seconds 3
-  $remaining = $null
   for ($i = 0; $i -lt 5; $i++) {
     $remaining = @(Get-Process -Name "opencode" -ErrorAction SilentlyContinue)
     if ($remaining.Count -eq 0) { break }
@@ -216,10 +270,17 @@ function Stop-OpenCodeBridge {
   try {
     $proc = Get-Process -Id $pid_ -ErrorAction Stop
     $proc.Kill()
-    $proc.WaitForExit(5000) | Out-Null
+    if (-not $proc.WaitForExit(5000)) {
+      Write-Warning "[opencode-bridge] Gateway process (pid $pid_) did not exit within 5s — may need manual cleanup"
+    }
     Write-Host "[opencode-bridge] Gateway stopped (pid $pid_)"
   } catch {
-    Write-Warning "[opencode-bridge] Could not stop gateway process: $_"
+    if ($_.Exception.Message -match "Cannot find a process") {
+      # Already gone — fine
+      Write-Host "[opencode-bridge] Gateway already stopped"
+    } else {
+      Write-Warning "[opencode-bridge] Could not stop gateway process: $_"
+    }
   }
 }
 
@@ -227,35 +288,39 @@ function Stop-OpenCodeBridge {
 .SYNOPSIS
   Reports runtime state of the opencode bridge and gateway.
 
-.OUTPUTS
-  PSCustomObject with: BridgeReady (bool), Port (int), ProcessId (int|null),
-  ImagePath (string|null), Uptime (TimeSpan|null), LockFile (string).
+.DESCRIPTION
+  Returns a PSCustomObject with: BridgeReady (bool), Port (int),
+  ProcessId (int|null), ImagePath (string|null), CmdLine (string|null),
+  Uptime (TimeSpan|null), LockFile (string), LockHeld (bool).
 #>
 function Get-OpenCodeBridgeStatus {
   [CmdletBinding()] param()
 
   $conn = Get-BridgeConnection
-  $procId = $null; $imagePath = $null; $uptime = $null; $ready = $false
+  $procId = $null; $imagePath = $null; $cmdLine = $null; $uptime = $null; $ready = $false
+
   if ($conn -and (Test-BridgeProcess -ProcessId $conn.OwningProcess)) {
     $procId = [int]$conn.OwningProcess
     $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
     if ($p) {
       $imagePath = $p.ExecutablePath
-      $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-      if ($proc.StartTime) { $uptime = (Get-Date) - $proc.StartTime }
+      $cmdLine   = $p.CommandLine
+      $pp = Get-Process -Id $procId -ErrorAction SilentlyContinue
+      if ($pp -and $pp.StartTime) { $uptime = (Get-Date) - $pp.StartTime }
       $ready = $true
     }
   }
 
   [PSCustomObject]@{
     BridgeReady = $ready
-    Port         = $script:BridgePort
-    ProcessId    = $procId
-    ImagePath    = $imagePath
-    CmdLine      = $p.CommandLine
-    Uptime       = $uptime
-    LockFile     = $script:LockFilePath
-    LockHeld     = (Test-Path $script:LockFilePath)
+    Port        = $script:BridgePort
+    ProcessId   = $procId
+    ImagePath   = $imagePath
+    CmdLine     = $cmdLine
+    Uptime      = $uptime
+    LockFile    = $script:LockFilePath
+    LockHeld    = (Test-Path $script:LockFilePath)
+    BridgeCmd   = $script:BridgeCmd
   }
 }
 
@@ -266,18 +331,17 @@ function Get-OpenCodeBridgeStatus {
 .DESCRIPTION
   Verifies the hermes-nous provider is configured with the local baseURL,
   and that every model referenced by the active preset's roles resolves to
-  the hermes-nous provider. Returns $true on success and emits warnings
+  the hermes-nous provider. Returns $true on success and writes warnings
   (never throws) on drift, so a degraded config doesn't break the wrapper.
 
-.OUTPUTS
-  bool — $true when config is coherent and bridge-ready.
+  Config files larger than MaxConfigSize (1 MB default) are rejected.
 #>
 function Test-OpenCodeConfig {
   [CmdletBinding()] param()
 
-  # Strip // line comments and /* */ block comments from JSONC, then parse.
-  # Only strip comments at line-start and standalone block comments.
-  # Do NOT strip trailing // — it would eat URLs like http:// inside string values.
+  # Helper: strip JSONC comments safely.
+  # Only strips /* */ block comments and line-start // comments.
+  # Does NOT strip trailing // to avoid eating URLs like http:// inside strings.
   $stripComments = {
     param([string]$Text)
     $Text = $Text -replace '/\*[\s\S]*?\*/', ''
@@ -285,25 +349,37 @@ function Test-OpenCodeConfig {
     $Text
   }
 
-  # opencode.jsonc
-  if (-not (Test-Path $script:OpenCodeConfig)) {
-    Write-Warning "[opencode-bridge] Missing config: $($script:OpenCodeConfig)"
-    return $false
-  }
-  try {
-    $raw = Get-Content -Raw -LiteralPath $script:OpenCodeConfig
-    $json = (& $stripComments $raw) | ConvertFrom-Json -ErrorAction Stop
-  } catch {
-    Write-Warning "[opencode-bridge] Could not parse $($script:OpenCodeConfig): $_"
-    return $false
+  # Helper: parse JSONC file with size limit and comment stripping
+  $parseJsonc = {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+      Write-Warning "[opencode-bridge] Missing config: $Path"
+      return $null
+    }
+    $size = (Get-Item $Path).Length
+    if ($size -gt $script:MaxConfigSize) {
+      Write-Warning "[opencode-bridge] Config too large ($size bytes, max $($script:MaxConfigSize)): $Path"
+      return $null
+    }
+    try {
+      $raw = Get-Content -Raw -LiteralPath $Path
+      ($raw | ForEach-Object { & $stripComments $_ }) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+      Write-Warning "[opencode-bridge] Could not parse $Path : $_"
+      return $null
+    }
   }
 
-  $provider = $json.provider.$script:HermesProvider
+  # Parse opencode.jsonc
+  $json = & $parseJsonc $script:OpenCodeConfig
+  if (-not $json) { return $false }
+
+  # Check hermes-nous provider (use dot notation for case-insensitive access)
+  $provider = $json.provider.$($script:HermesProvider)
   if (-not $provider) {
     Write-Warning "[opencode-bridge] '$($script:HermesProvider)' provider missing from opencode.jsonc — bridge has no consumer"
     return $false
   }
-
   $baseURL = $provider.options.baseURL
   $expected = "http://$($script:BridgeHost):$($script:BridgePort)/v1"
   if ($baseURL -ne $expected) {
@@ -311,17 +387,9 @@ function Test-OpenCodeConfig {
     return $false
   }
 
-  # oh-my-opencode-slim preset
-  if (-not (Test-Path $script:OpenCodeSlimCfg)) {
-    Write-Warning "[opencode-bridge] Missing preset config: $($script:OpenCodeSlimCfg)"
-    return $false
-  }
-  try {
-    $slim = Get-Content -Raw -LiteralPath $script:OpenCodeSlimCfg | ConvertFrom-Json -ErrorAction Stop
-  } catch {
-    Write-Warning "[opencode-bridge] Could not parse preset config: $_"
-    return $false
-  }
+  # Parse oh-my-opencode-slim preset
+  $slim = & $parseJsonc $script:OpenCodeSlimCfg
+  if (-not $slim) { return $false }
 
   $active = $slim.preset
   if (-not $active) {
@@ -334,14 +402,16 @@ function Test-OpenCodeConfig {
     return $false
   }
 
-  # Verify every role's model is on the hermes-nous provider.
-  $roleNames = 'orchestrator','oracle','explorer','librarian','designer','fixer','observer'
+  # Validate every role's model: must live on hermes-nous provider.
+  # Iterate preset properties dynamically (not hardcoded role list).
   $ok = $true
-  foreach ($role in $roleNames) {
-    $m = $preset.$role.model
-    if (-not $m) { continue }
-    if ($m -notmatch "^$([regex]::Escape($script:HermesProvider))/") {
-      Write-Warning "[opencode-bridge] Preset '$active' role '$role' uses '$m' — not on '$($script:HermesProvider)'"
+  foreach ($roleKey in $preset.PSObject.Properties.Name) {
+    $role = $preset.$roleKey
+    if (-not $role -or $role -isnot [PSCustomObject]) { continue }
+    $model = $role.model
+    if (-not $model) { continue }
+    if ($model -notmatch "^$([regex]::Escape($script:HermesProvider))/") {
+      Write-Warning "[opencode-bridge] Preset '$active' role '$roleKey' uses '$model' — not on '$($script:HermesProvider)'"
       $ok = $false
     }
   }
@@ -351,12 +421,10 @@ function Test-OpenCodeConfig {
 <#
 .SYNOPSIS
   Resolves the path to the opencode CLI executable.
+  Prefers copies without spaces in the path to avoid SpawnSync issues.
 #>
 function Get-OpenCodePath {
   [CmdletBinding()] param()
-  # Prefer the LOCALAPPDATA copy (no spaces in path) to avoid cmd shim issues.
-  # The npm install creates a .cmd shim at "C:\Program Files\nodejs\opencode.cmd"
-  # which can cause problems with SpawnSync and other shell tooling.
   $candidates = @(
     "$env:LOCALAPPDATA\Programs\opencode\opencode.exe",
     "$env:USERPROFILE\scoop\shims\opencode.exe",
@@ -365,7 +433,13 @@ function Get-OpenCodePath {
   foreach ($p in $candidates) {
     if (Test-Path $p) { return $p }
   }
-  try { return (Get-Command opencode -ErrorAction Stop).Source } catch { }
+  try {
+    $cmd = Get-Command opencode -ErrorAction Stop
+    # Validate it: must be an executable (not an alias or function)
+    if ($cmd.CommandType -in @('Application', 'ExternalScript')) {
+      return $cmd.Source
+    }
+  } catch {}
   return $null
 }
 
