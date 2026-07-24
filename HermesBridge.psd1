@@ -7,7 +7,7 @@
   Copyright         = '(c) zerop. All rights reserved.'
   Description       = 'Hermes Nous Bridge lifecycle management for OpenCode integration.'
   PowerShellVersion = '7.0'
-  FunctionsToExport = @('Start-HermesBridge', 'Stop-HermesBridge')
+  FunctionsToExport = @('Start-HermesBridge', 'Stop-HermesBridge', 'Get-OpenCodePath')
   FileList          = @('HermesBridge.psm1')
   PrivateData       = @{
     PSData = @{
