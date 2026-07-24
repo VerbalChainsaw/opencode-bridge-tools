@@ -7,10 +7,11 @@ $env:OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "true"
 
 # Import bridge management module
 $modulePath = Join-Path $PSScriptRoot 'HermesBridge.psd1'
-if (Test-Path $modulePath) {
+try {
   Import-Module $modulePath -Force -ErrorAction Stop
-} else {
-  Write-Warning "[hermes] Module not found at $modulePath — bridge auto-start disabled"
+} catch {
+  Write-Warning "[hermes] Failed to load module from $modulePath : $_"
+  Write-Warning "[hermes] Bridge auto-start disabled"
 }
 
 # Override opencode to manage bridge lifecycle
@@ -20,7 +21,7 @@ function global:opencode {
   try {
     & "C:\Program Files\nodejs\opencode.cmd" @args
   } finally {
-    $script:SessionDuration = [math]::Round(((Get-Date) - $start).TotalSeconds)
-    Stop-HermesBridge
+    $duration = [math]::Round(((Get-Date) - $start).TotalSeconds)
+    Stop-HermesBridge -SessionDuration $duration
   }
 }

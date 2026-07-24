@@ -101,10 +101,12 @@ function Start-HermesBridge {
 #>
 function Stop-HermesBridge {
   [CmdletBinding()]
-  param()
+  param(
+    [int]$SessionDuration = $script:SessionDuration
+  )
 
   # Only kill bridge after a real interaction (ran > 15s), not quick CLI commands
-  if ($script:SessionDuration -lt 15) { return }
+  if ($SessionDuration -lt 15) { return }
 
   # Wait for OpenCode to fully exit, then confirm no other instances
   Start-Sleep -Seconds 3
