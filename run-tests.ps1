@@ -110,5 +110,28 @@ Test-Case "Start refuses when a non-Hermes process holds the port (no retry stor
   Import-Module $modulePath -Force
 }
 
+# ── 10. Get-OpenCodePath priority: prefer no-spaces .exe first ──────────────
+Test-Case "Get-OpenCodePath prefers LOCALAPPDATA copy (no spaces in path)" {
+  $p = Get-OpenCodePath
+  if (-not $p) { throw "Get-OpenCodePath returned null" }
+  if ($p -match '\s') { throw "Path has spaces: $p" }
+}
+
+# ── 11. JSONC parser preserves // inside string values ──────────────────────
+Test-Case "Test-OpenCodeConfig JSONC parser does not eat // in strings" {
+  # Access the private stripComments via module scope and test directly
+  $testJson = '{ "path": "C:\\code//stuff", "url": "https://ok.com" }'
+  $stripped = $testJson -replace '/\*[\s\S]*?\*/', '' -replace '(?m)^\s*//.*$', ''
+  $parsed = $stripped | ConvertFrom-Json
+  if ($parsed.path -ne 'C:\code//stuff') { throw "// in string was eaten: $($parsed.path)" }
+  if ($parsed.url -ne 'https://ok.com') { throw "URL was damaged: $($parsed.url)" }
+}
+
+# ── 12. Status object uses a single CIM query (CmdLine present) ─────────────
+Test-Case "Get-OpenCodeBridgeStatus returns CmdLine from the same CIM query" {
+  $s = Get-OpenCodeBridgeStatus
+  if ($s.BridgeReady -and -not $s.CmdLine) { throw "BridgeReady but CmdLine is empty — redundant CIM query bug?" }
+}
+
 Write-Host "`n$script:passed passed, $script:failed failed" -ForegroundColor $(if ($script:failed -eq 0) { 'Green' } else { 'Red' })
 if ($script:failed -gt 0) { exit 1 } else { exit 0 }

@@ -45,6 +45,15 @@ function script:Test-SkipBridge {
 
 # Override `opencode` to manage the gateway lifecycle around it.
 function global:opencode {
+  # Guard: if the cached path went stale (e.g. opencode updated mid-session),
+  # re-resolve once before giving up.
+  if ($script:OpenCodePath -and -not (Test-Path $script:OpenCodePath)) {
+    $script:OpenCodePath = Get-OpenCodePath
+    if ($script:OpenCodePath) {
+      Write-Host "[opencode-bridge] Re-resolved opencode path: $($script:OpenCodePath)" -ForegroundColor Yellow
+    }
+  }
+
   if (-not $script:OpenCodePath) {
     Write-Error "opencode not found on this system"
     return

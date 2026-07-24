@@ -252,7 +252,7 @@ function Get-OpenCodeBridgeStatus {
     Port         = $script:BridgePort
     ProcessId    = $procId
     ImagePath    = $imagePath
-    CmdLine      = (Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).CommandLine
+    CmdLine      = $p.CommandLine
     Uptime       = $uptime
     LockFile     = $script:LockFilePath
     LockHeld     = (Test-Path $script:LockFilePath)
@@ -276,11 +276,12 @@ function Test-OpenCodeConfig {
   [CmdletBinding()] param()
 
   # Strip // line comments and /* */ block comments from JSONC, then parse.
+  # Only strip comments at line-start and standalone block comments.
+  # Do NOT strip trailing // — it would eat URLs like http:// inside string values.
   $stripComments = {
     param([string]$Text)
     $Text = $Text -replace '/\*[\s\S]*?\*/', ''
     $Text = $Text -replace '(?m)^\s*//.*$', ''
-    $Text = $Text -replace '(?m)([^:])//.*$', '$1'   # trailing, not after ':'
     $Text
   }
 
@@ -353,10 +354,13 @@ function Test-OpenCodeConfig {
 #>
 function Get-OpenCodePath {
   [CmdletBinding()] param()
+  # Prefer the LOCALAPPDATA copy (no spaces in path) to avoid cmd shim issues.
+  # The npm install creates a .cmd shim at "C:\Program Files\nodejs\opencode.cmd"
+  # which can cause problems with SpawnSync and other shell tooling.
   $candidates = @(
-    "C:\Program Files\nodejs\opencode.cmd",
     "$env:LOCALAPPDATA\Programs\opencode\opencode.exe",
-    "$env:USERPROFILE\scoop\shims\opencode.exe"
+    "$env:USERPROFILE\scoop\shims\opencode.exe",
+    "C:\Program Files\nodejs\opencode.cmd"
   )
   foreach ($p in $candidates) {
     if (Test-Path $p) { return $p }
