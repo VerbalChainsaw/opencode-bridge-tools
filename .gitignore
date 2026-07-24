@@ -3,9 +3,21 @@
 *.pid
 
 # Test output
-tests/*.xml
-tests/TestResults.xml
+testResults.xml
+TestResults.xml
+
+# PowerShell artifacts
+*.psm1.orig
+*.ps1.orig
 
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# Editor
+*.swp
+*.swo
+*.sublime-*
+.vscode/
+.idea/
