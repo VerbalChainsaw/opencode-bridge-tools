@@ -1,0 +1,11 @@
+# Logs and runtime artifacts
+*.log
+*.pid
+
+# Test output
+tests/*.xml
+tests/TestResults.xml
+
+# OS
+.DS_Store
+Thumbs.db
