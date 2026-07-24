@@ -32,7 +32,7 @@ Test-Case "Test-OpenCodeConfig is exported"   { Get-Command Test-OpenCodeConfig 
 # ── 2. Manifest integrity ──────────────────────────────────────────────────
 Test-Case "Manifest self-validates with correct version" {
   $m = Test-ModuleManifest -Path $modulePath -ErrorAction Stop
-  if ($m.Version -ne [version]'2.1.0') { throw "Wrong version: $($m.Version)" }
+  if ($m.Version -ne [version]'3.0.0') { throw "Wrong version: $($m.Version)" }
   if ($m.PowerShellVersion -lt [version]'7.0') { throw "PSVersion too low" }
 }
 

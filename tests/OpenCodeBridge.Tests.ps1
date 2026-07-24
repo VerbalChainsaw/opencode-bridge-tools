@@ -19,7 +19,7 @@ Describe 'Module exports' {
 
   It 'Has a valid module manifest with the correct version' {
     $m = Test-ModuleManifest -Path $modulePath -ErrorAction Stop
-    $m.Version | Should -Be '2.1.0'
+    $m.Version | Should -Be '3.0.0'
   }
 }
 

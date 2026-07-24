@@ -1,6 +1,6 @@
 @{
   RootModule        = 'OpenCodeBridge.psm1'
-  ModuleVersion     = '2.1.0'
+  ModuleVersion     = '3.0.0'
   GUID              = '4030d944-02aa-47cc-8f50-43d68a362e08'
   Author            = 'zerop'
   CompanyName       = 'Unknown'
